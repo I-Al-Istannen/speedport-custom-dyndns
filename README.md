@@ -8,7 +8,7 @@ supported by the Speedport "Smart" 4? Me too!
 
 This repository contains a small rust server, also available as a docker image,
 that allows you to do just that. It acts as a DynDNS v2 server which you can
-enter as "Custom DynDNS" and then forwards all requests to Cloudflare. Other
+enter as "Custom DynDNS" and then forwards all requests to cloudflare. Other
 providers are also possible, I just only needed cloudflare so far 🐞
 
 ## In Action
