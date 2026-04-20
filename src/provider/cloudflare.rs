@@ -1,10 +1,10 @@
+use super::{DnsEntry, DnsProvider, DnsRecordType, Origin, RecordId};
+use crate::types::ensure_env_vars;
 use async_trait::async_trait;
 use rootcause::prelude::ResultExt;
 use rootcause::{Report, report};
 use serde_json::json;
-use tracing::debug;
-
-use super::{DnsEntry, DnsProvider, DnsRecordType, Origin, RecordId};
+use tracing::info;
 
 pub struct CloudflareProvider {
     api_token: String,
@@ -12,11 +12,15 @@ pub struct CloudflareProvider {
 }
 
 impl CloudflareProvider {
-    pub fn new(api_token: impl Into<String>) -> Self {
-        Self {
-            api_token: api_token.into(),
+    pub fn new_from_env() -> Result<Self, Report> {
+        ensure_env_vars(&["CLOUDFLARE_API_TOKEN"])?;
+        let api_token = std::env::var("CLOUDFLARE_API_TOKEN")
+            .context("CLOUDFLARE_API_TOKEN environment variable not set")?;
+
+        Ok(Self {
+            api_token,
             client: reqwest::Client::new(),
-        }
+        })
     }
 
     async fn get_zone_id(&self, origin: &Origin) -> Result<String, Report> {
@@ -55,6 +59,10 @@ impl CloudflareProvider {
 
 #[async_trait]
 impl DnsProvider for CloudflareProvider {
+    fn name(&self) -> &'static str {
+        "Cloudflare"
+    }
+
     async fn list_records(&self, origin: &Origin) -> Result<Vec<DnsEntry>, Report> {
         let zone_id = self.get_zone_id(origin).await?;
         let response = self
@@ -89,11 +97,11 @@ impl DnsProvider for CloudflareProvider {
             .context("Parsing Cloudflare DNS records response")
             .attach(format!("origin: '{origin}'"))?;
 
-        return Ok(response
+        Ok(response
             .result
             .into_iter()
             .filter_map(|it| it.into())
-            .collect());
+            .collect())
     }
 
     async fn update_record(
@@ -135,6 +143,20 @@ impl DnsProvider for CloudflareProvider {
                 )))
         }
     }
+
+    async fn validate(&self, origin: &Origin) -> Result<(), Report> {
+        info!("Listing all DNS records...");
+        let zone_dns_records = self
+            .list_records(origin)
+            .await
+            .context("Failed to list DNS records on startup")
+            .attach("I think you probably want to fix that before I start...")
+            .attach(format!("Origin: {}", origin.0))?;
+
+        info!("Found {} DNS records", zone_dns_records.len());
+
+        Ok(())
+    }
 }
 
 #[derive(serde::Deserialize, Clone)]
@@ -163,13 +185,8 @@ struct CloudflareDnsRecord {
 
 impl From<CloudflareDnsRecord> for Option<DnsEntry> {
     fn from(record: CloudflareDnsRecord) -> Self {
-        let typ = match record.r#type.as_str() {
-            "A" => DnsRecordType::A,
-            "AAAA" => DnsRecordType::AAAA,
-            _ => {
-                debug!(typ = %record.r#type, "Skipping unsupported record type");
-                return None;
-            }
+        let Ok(typ) = DnsRecordType::try_from(record.r#type) else {
+            return None;
         };
         Some(DnsEntry {
             typ,

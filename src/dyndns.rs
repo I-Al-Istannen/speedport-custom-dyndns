@@ -1,8 +1,3 @@
-use std::{
-    net::{Ipv4Addr, Ipv6Addr},
-    str::FromStr,
-};
-
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -10,8 +5,14 @@ use axum::{
 };
 use rootcause::{Report, bail, prelude::ResultExt};
 use serde::Deserialize;
+use std::collections::HashSet;
+use std::{
+    net::{Ipv4Addr, Ipv6Addr},
+    str::FromStr,
+};
 use tracing::{info, warn};
 
+use crate::provider::DnsProvider;
 use crate::{provider::DnsRecordType, types::AppState};
 
 pub(crate) async fn handle_dyndns_request(
@@ -46,30 +47,35 @@ pub(crate) async fn handle_dyndns_request(
             .into_response());
     }
 
-    let ips = match update_record(&state, &query.hostname, &ip).await {
-        Err(e) => {
-            warn!(
-                error = %e,
-                domain = %query.hostname,
-                ip = ?ip,
-                "failed to update DNS record"
-            );
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to update DNS record: {}", e),
-            )
-                .into_response());
-        }
-        Ok(ips) => ips,
-    };
+    let mut all_ips = HashSet::new();
 
-    info!(
-        domain = %query.hostname,
-        ips = ?ips,
-        "successfully updated DNS record"
-    );
+    for provider in &state.dns_providers {
+        let ips = match update_record(&state, provider.as_ref(), &query.hostname, &ip).await {
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    domain = %query.hostname,
+                    ip = ?ip,
+                    "failed to update DNS record"
+                );
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to update DNS record: {}", e),
+                )
+                    .into_response());
+            }
+            Ok(ips) => ips,
+        };
+        info!(
+            domain = %query.hostname,
+            ips = ?ips,
+            provider = %provider.name(),
+            "successfully updated DNS record"
+        );
+        all_ips.extend(ips)
+    }
 
-    Ok(ips
+    Ok(all_ips
         .into_iter()
         .map(|it| format!("good {}", it))
         .collect::<Vec<_>>()
@@ -78,13 +84,13 @@ pub(crate) async fn handle_dyndns_request(
 
 async fn update_record(
     state: &AppState,
+    provider: &(dyn DnsProvider + Send + Sync),
     domain: &str,
     ip: &ParsedIpUpdate,
 ) -> Result<Vec<String>, Report> {
     let mut updated_ips = Vec::new();
 
-    let records = state
-        .dns_provider
+    let records = provider
         .list_records(&state.dns_origin)
         .await?
         .into_iter()
@@ -100,8 +106,7 @@ async fn update_record(
             );
             continue;
         };
-        state
-            .dns_provider
+        provider
             .update_record(&state.dns_origin, &record.id, new_ip)
             .await
             .attach(format!("For domain '{domain}'"))

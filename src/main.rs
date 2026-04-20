@@ -1,4 +1,3 @@
-use std::env::VarError;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -10,7 +9,7 @@ use axum_extra::TypedHeader;
 use axum_extra::headers::Authorization;
 use axum_extra::headers::authorization::Basic;
 use rootcause::prelude::ResultExt;
-use rootcause::report;
+use rootcause::{bail, report};
 use tokio::select;
 use tokio::signal::unix::SignalKind;
 use tokio::signal::unix::signal;
@@ -21,6 +20,9 @@ use tracing::warn;
 use tracing::{Instrument, debug};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use crate::provider::DnsProvider;
+use crate::provider::netcup::NetcupProvider;
+use crate::types::ensure_env_vars;
 use crate::{
     provider::{Origin, cloudflare::CloudflareProvider},
     types::AppState,
@@ -48,23 +50,48 @@ async fn main() {
 async fn run_server() -> Result<(), rootcause::Report> {
     info!("Starting server");
 
-    ensure_env_vars(&["CLOUDFLARE_API_TOKEN", "PASSWORD", "ORIGIN"])?;
+    ensure_env_vars(&["PASSWORD", "ORIGIN", "PROVIDERS"])?;
 
     let interface = std::env::var("INTERFACE").unwrap_or("0.0.0.0".to_string());
     let port: String = std::env::var("PORT").unwrap_or("3000".to_string());
-    let cloudflare_token = std::env::var("CLOUDFLARE_API_TOKEN")
-        .context("CLOUDFLARE_API_TOKEN environment variable not set")?;
     let client_password =
         std::env::var("PASSWORD").context("PASSWORD environment variable not set")?;
     let origin_str = std::env::var("ORIGIN").context("ORIGIN environment variable not set")?;
+    let enabled_providers =
+        std::env::var("PROVIDERS").context("PROVIDERS environment variable not set")?;
+
+    let mut dns_providers: Vec<Arc<dyn DnsProvider + Send + Sync>> = Vec::new();
+    for provider in enabled_providers.split(",").filter(|s| !s.is_empty()) {
+        match provider.trim().to_ascii_lowercase().as_str() {
+            "cloudflare" => dns_providers.push(Arc::new(CloudflareProvider::new_from_env()?)),
+            "netcup" => dns_providers.push(Arc::new(NetcupProvider::new_from_env()?)),
+            other => {
+                bail!(
+                    "Unknown provider specified in PROVIDERS environment variable: '{}'",
+                    other
+                );
+            }
+        }
+    }
+
+    if dns_providers.is_empty() {
+        return Err(report!("No valid providers found")
+            .attach(format!("env PROVIDERS={enabled_providers}")));
+    }
 
     let state = AppState {
         client_password,
         dns_origin: Origin(origin_str),
-        dns_provider: Arc::new(CloudflareProvider::new(&cloudflare_token)),
+        dns_providers,
     };
 
-    validate_dns_zone(&state).await?;
+    for provider in &state.dns_providers {
+        provider
+            .validate(&state.dns_origin)
+            .await
+            .context("Failed to validate DNS provider")
+            .attach(format!("Provider: {}", provider.name()))?;
+    }
 
     let app = Router::new()
         .route("/nic/update", get(dyndns::handle_dyndns_request))
@@ -88,40 +115,6 @@ async fn run_server() -> Result<(), rootcause::Report> {
     .with_graceful_shutdown(async { graceful_shutdown().await }.instrument(Span::current()))
     .await
     .context("Server error")?;
-
-    Ok(())
-}
-
-fn ensure_env_vars(vars: &[&str]) -> Result<(), rootcause::Report> {
-    let mut error = report!("Missing required environment variable");
-    let mut is_error = false;
-    for var in vars {
-        match std::env::var(var) {
-            Ok(_) => continue,
-            Err(VarError::NotPresent) => {
-                error = error.attach(format!("'{}' is not set", var));
-                is_error = true;
-            }
-            Err(VarError::NotUnicode(e)) => {
-                error = error.attach(format!("'{}' is not valid unicode: '{}'", var, e.display()));
-                is_error = true;
-            }
-        }
-    }
-    if is_error { Err(error) } else { Ok(()) }
-}
-
-async fn validate_dns_zone(state: &AppState) -> Result<(), rootcause::Report> {
-    info!("Listing all DNS records...");
-    let zone_dns_records = state
-        .dns_provider
-        .list_records(&state.dns_origin)
-        .await
-        .context("Failed to list DNS records on startup")
-        .attach("I think you probably want to fix that before I start...")
-        .attach(format!("Origin: {}", state.dns_origin.0))?;
-
-    info!("Found {} DNS records", zone_dns_records.len());
 
     Ok(())
 }
