@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -8,8 +9,9 @@ use axum::{Router, routing::get};
 use axum_extra::TypedHeader;
 use axum_extra::headers::Authorization;
 use axum_extra::headers::authorization::Basic;
+use rootcause::option_ext::OptionExt;
 use rootcause::prelude::ResultExt;
-use rootcause::{bail, report};
+use rootcause::{Report, bail, report};
 use tokio::select;
 use tokio::signal::unix::SignalKind;
 use tokio::signal::unix::signal;
@@ -47,7 +49,7 @@ async fn main() {
     }
 }
 
-async fn run_server() -> Result<(), rootcause::Report> {
+async fn run_server() -> Result<(), Report> {
     info!("Starting server");
 
     ensure_env_vars(&["PASSWORD", "ORIGIN", "PROVIDERS"])?;
@@ -60,34 +62,16 @@ async fn run_server() -> Result<(), rootcause::Report> {
     let enabled_providers =
         std::env::var("PROVIDERS").context("PROVIDERS environment variable not set")?;
 
-    let mut dns_providers: Vec<Arc<dyn DnsProvider + Send + Sync>> = Vec::new();
-    for provider in enabled_providers.split(",").filter(|s| !s.is_empty()) {
-        match provider.trim().to_ascii_lowercase().as_str() {
-            "cloudflare" => dns_providers.push(Arc::new(CloudflareProvider::new_from_env()?)),
-            "netcup" => dns_providers.push(Arc::new(NetcupProvider::new_from_env()?)),
-            other => {
-                bail!(
-                    "Unknown provider specified in PROVIDERS environment variable: '{}'",
-                    other
-                );
-            }
-        }
-    }
-
-    if dns_providers.is_empty() {
-        return Err(report!("No valid providers found")
-            .attach(format!("env PROVIDERS={enabled_providers}")));
-    }
-
-    let state = AppState {
+    let state = AppState::new(
+        Origin(origin_str),
         client_password,
-        dns_origin: Origin(origin_str),
-        dns_providers,
-    };
+        get_providers(enabled_providers)?,
+        get_provider_origin_mappings()?,
+    );
 
     for provider in &state.dns_providers {
         provider
-            .validate(&state.dns_origin)
+            .validate(&state.origin_for(provider.as_ref()))
             .await
             .context("Failed to validate DNS provider")
             .attach(format!("Provider: {}", provider.name()))?;
@@ -117,6 +101,58 @@ async fn run_server() -> Result<(), rootcause::Report> {
     .context("Server error")?;
 
     Ok(())
+}
+
+fn get_providers(
+    enabled_providers: String,
+) -> Result<Vec<Arc<dyn DnsProvider + Send + Sync>>, Report> {
+    let mut dns_providers: Vec<Arc<dyn DnsProvider + Send + Sync>> = Vec::new();
+    for provider in enabled_providers.split(",").filter(|s| !s.is_empty()) {
+        match provider.trim().to_ascii_lowercase().as_str() {
+            "cloudflare" => dns_providers.push(Arc::new(CloudflareProvider::new_from_env()?)),
+            "netcup" => dns_providers.push(Arc::new(NetcupProvider::new_from_env()?)),
+            other => {
+                bail!(
+                    "Unknown provider specified in PROVIDERS environment variable: '{}'",
+                    other
+                );
+            }
+        }
+    }
+
+    if dns_providers.is_empty() {
+        return Err(report!("No valid providers found")
+            .attach(format!("env PROVIDERS={enabled_providers}")));
+    }
+
+    Ok(dns_providers)
+}
+
+fn get_provider_origin_mappings() -> Result<HashMap<String, Vec<(Origin, Origin)>>, Report> {
+    const PREFIX: &str = "PROVIDER_ORIGIN_MAPPING_";
+
+    let mut provider_mappings = HashMap::new();
+    for (name, val) in std::env::vars().filter(|(name, _)| name.starts_with(PREFIX)) {
+        let provider_name = name
+            .strip_prefix(PREFIX)
+            .expect("prefix checked")
+            .to_ascii_lowercase();
+
+        let mappings = val
+            .split(",")
+            .map(|it| {
+                let (from, to) = it
+                    .split_once("=")
+                    .context("provider mapping entry is malformed")
+                    .attach(format!("mapping: '{it}'"))?;
+                Ok((Origin(from.to_string()), Origin(to.to_string())))
+            })
+            .collect::<Result<Vec<_>, Report>>()?;
+
+        provider_mappings.insert(provider_name, mappings);
+    }
+
+    Ok(provider_mappings)
 }
 
 async fn ensure_auth(

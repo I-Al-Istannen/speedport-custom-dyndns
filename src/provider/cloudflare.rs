@@ -60,7 +60,7 @@ impl CloudflareProvider {
 #[async_trait]
 impl DnsProvider for CloudflareProvider {
     fn name(&self) -> &'static str {
-        "Cloudflare"
+        "cloudflare"
     }
 
     async fn list_records(&self, origin: &Origin) -> Result<Vec<DnsEntry>, Report> {

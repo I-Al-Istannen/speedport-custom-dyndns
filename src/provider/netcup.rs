@@ -194,7 +194,7 @@ impl NetcupProvider {
 #[async_trait]
 impl DnsProvider for NetcupProvider {
     fn name(&self) -> &'static str {
-        "Netcup"
+        "netcup"
     }
 
     async fn list_records(&self, origin: &Origin) -> Result<Vec<DnsEntry>, Report> {

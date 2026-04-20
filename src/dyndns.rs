@@ -12,7 +12,7 @@ use std::{
 };
 use tracing::{info, warn};
 
-use crate::provider::DnsProvider;
+use crate::provider::{DnsProvider, Origin};
 use crate::{provider::DnsRecordType, types::AppState};
 
 pub(crate) async fn handle_dyndns_request(
@@ -30,31 +30,37 @@ pub(crate) async fn handle_dyndns_request(
     })?;
 
     info!(ip = ?ip, domain=?query.hostname, "parsed IP update");
-
-    if !state.dns_origin.is_subdomain(&query.hostname) {
-        warn!(
-            domain = %query.hostname,
-            origin = %state.dns_origin.0,
-            "requested domain is not a subdomain of the configured origin"
-        );
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "domain '{}' is not a subdomain of '{}'",
-                query.hostname, state.dns_origin.0
-            ),
-        )
-            .into_response());
-    }
-
     let mut all_ips = HashSet::new();
 
     for provider in &state.dns_providers {
-        let ips = match update_record(&state, provider.as_ref(), &query.hostname, &ip).await {
+        let expected_origin =
+            state.map_origin(state.origin_for(provider.as_ref()), provider.as_ref());
+        let actual_origin = state.map_origin(Origin(query.hostname.clone()), provider.as_ref());
+        if !expected_origin.is_subdomain(&actual_origin.0) {
+            warn!(
+                query = %query.hostname,
+                mapped = %actual_origin,
+                expected = %expected_origin,
+                "requested domain is not a subdomain of the configured origin"
+            );
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "domain '{}' (=> '{}') is not a subdomain of '{}'",
+                    query.hostname,
+                    actual_origin,
+                    state.origin_for(provider.as_ref())
+                ),
+            )
+                .into_response());
+        }
+
+        let ips = match update_record(&state, provider.as_ref(), &actual_origin.0, &ip).await {
             Err(e) => {
                 warn!(
                     error = %e,
-                    domain = %query.hostname,
+                    query = %query.hostname,
+                    mapped = %actual_origin,
                     ip = ?ip,
                     "failed to update DNS record"
                 );
@@ -67,7 +73,8 @@ pub(crate) async fn handle_dyndns_request(
             Ok(ips) => ips,
         };
         info!(
-            domain = %query.hostname,
+            query = %query.hostname,
+            mapped = %actual_origin,
             ips = ?ips,
             provider = %provider.name(),
             "successfully updated DNS record"
@@ -91,7 +98,7 @@ async fn update_record(
     let mut updated_ips = Vec::new();
 
     let records = provider
-        .list_records(&state.dns_origin)
+        .list_records(&state.origin_for(provider))
         .await?
         .into_iter()
         .filter(|r| r.name == domain)
@@ -107,7 +114,7 @@ async fn update_record(
             continue;
         };
         provider
-            .update_record(&state.dns_origin, &record.id, new_ip)
+            .update_record(&state.origin_for(provider), &record.id, new_ip)
             .await
             .attach(format!("For domain '{domain}'"))
             .attach(format!("For {:?} record", record_type))?;
