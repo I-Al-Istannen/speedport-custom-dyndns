@@ -11,7 +11,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Mutex};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const NETCUP_ENDPOINT: &str = "https://ccp.netcup.net/run/webservice/servers/endpoint.php?JSON";
 
@@ -42,6 +42,7 @@ enum NetcupStatus {
     Success,
 }
 
+#[derive(Debug)]
 struct NetcupSessionId {
     valid_until: Timestamp,
     key: String,
@@ -57,7 +58,7 @@ impl NetcupSessionId {
     }
 
     fn is_valid(&self) -> bool {
-        self.valid_until <= Timestamp::now()
+        self.valid_until >= Timestamp::now()
     }
 }
 
@@ -101,6 +102,11 @@ impl NetcupProvider {
         data.insert("apikey", self.api_key.clone().into());
         data.insert("customernumber", self.customer_number.clone().into());
         if let Some(id) = &self.api_session_id.lock().expect("mutex poisoned").as_ref() {
+            debug!(
+                ?id,
+                valid = id.is_valid(),
+                "Using existing session id for Netcup API request"
+            );
             data.insert("apisessionid", id.key.clone().into());
         }
 
@@ -161,9 +167,16 @@ impl NetcupProvider {
         if let Some(id) = &self.api_session_id.lock().expect("mutex poisoned").as_ref()
             && id.is_valid()
         {
+            debug!(
+                ?id,
+                "Already logged in to Netcup with valid session id, skipping login"
+            );
             return Ok(());
         }
-        *self.api_session_id.lock().expect("mutex poisoned") = Some(self.login().await?);
+        debug!("Logging in again");
+        let new_session_id = self.login().await?;
+        debug!(?new_session_id, "Got new session id from Netcup");
+        *self.api_session_id.lock().expect("mutex poisoned") = Some(new_session_id);
         Ok(())
     }
 
